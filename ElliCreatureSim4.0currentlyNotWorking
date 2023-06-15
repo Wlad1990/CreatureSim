@@ -1,0 +1,1148 @@
+import pygame
+import pymunk
+import pymunk.pygame_util
+import random
+import math
+import pygame_gui
+import pygame.freetype
+import os
+
+import self
+from pygame_gui.elements import UIHorizontalSlider, UIButton
+from pygame_gui.elements.ui_label import UILabel
+from sympy.physics.units import amount, force
+from pygame.math import Vector2
+
+SCREEN_WIDTH = 800
+SCREEN_HEIGHT = 600
+
+RESOURCE_COLORS = {
+    "wood": (139, 69, 19),
+    "food": (0, 255, 0),
+    "rock": (128, 128, 128),
+    "iron": (192, 192, 192),
+    "trap": (255, 0, 0),
+    "shelter": (0, 0, 255),
+    "stone": (128, 128, 128),
+}
+
+current_time = 0
+day_length = 1000
+
+
+class GameState:
+    def __init__(self, space, screen):
+        self.space = space
+        self.screen = screen
+        self.creatures = []
+        self.obstacles = []
+        self.predators = []
+        self.shelters = []
+        self.stones = []
+        self.running = True
+        self.paused = False
+
+
+# Initialize Pygame
+pygame.init()
+
+# Create a Pygame screen (window)
+screen_size = (800, 600)  # Replace with your desired screen size
+screen = pygame.display.set_mode(screen_size)
+
+# Create a Pymunk space
+space = pymunk.Space()
+
+# Now you can create a GameState with these
+game_state = GameState(space, screen)
+
+
+class DayNightCycle:
+    def __init__(self, day_length, night_length, dawn_length, dusk_length):
+        self.current_time = 0
+        self.day_length = day_length
+        self.night_length = night_length
+        self.dawn_length = dawn_length
+        self.dusk_length = dusk_length
+        self.total_length = day_length + night_length + dawn_length + dusk_length
+
+    def update(self, time_delta):
+        self.current_time = (self.current_time + time_delta) % self.total_length
+
+    def get_time_of_day(self):
+        if self.current_time < self.dawn_length:
+            return "dawn"
+        elif self.current_time < self.dawn_length + self.day_length:
+            return "day"
+        elif self.current_time < self.dawn_length + self.day_length + self.dusk_length:
+            return "dusk"
+        else:
+            return "night"
+
+
+day_night_cycle = DayNightCycle(day_length=5000, night_length=5000, dawn_length=1000, dusk_length=1000)
+
+# Game scaling
+map_size = 1  # 30 km²
+pixels_per_meter = 1  # 1 pixel represents 1 m²
+zoom_level = 1.0  # 1x zoom
+
+
+def set_font():
+    pygame.init()
+    pygame.freetype.init()
+
+    # List of preferred fonts
+    preferred_fonts = ["Arial", "Calibri", "Times New Roman"]
+
+    # Get a list of all available fonts
+    available_fonts = pygame.freetype.get_fonts()
+
+    # Check if any of the preferred fonts are available
+    for font in preferred_fonts:
+        if font in available_fonts:
+            return pygame.freetype.Font(font, 24)
+
+    # If none of the preferred fonts are available, use the default font
+    return pygame.freetype.Font(None, 24)
+
+
+font = set_font()
+
+
+def create_ground(space):
+    mass = 0
+    moment = pymunk.moment_for_box(mass, (1, 1))
+    ground_body = CustomBody(mass, moment, body_type=CustomBody.STATIC)
+    ground_shape = pymunk.Segment(ground_body, (0, 0), (SCREEN_WIDTH, 0), 0.0)
+    ground_shape.friction = 1.0
+    space.add(ground_body, ground_shape)
+    return ground_shape
+
+
+def draw_grid(surface, grid_spacing, color=(200, 200, 200)):
+    for x in range(0, int(map_size * 1000 * pixels_per_meter), grid_spacing):
+        pygame.draw.line(surface, color, (x, 0), (x, map_size * 1000 * pixels_per_meter))
+    for y in range(0, int(map_size * 1000 * pixels_per_meter), grid_spacing):
+        pygame.draw.line(surface, color, (0, y), (map_size * 1000 * pixels_per_meter, y))
+
+
+def draw_minimap(surface, creatures, obstacles, shelters, stones, zoom_level, mini_map_size=(200, 200)):
+    map_size = pymunk.Vec2d(1000, 1000)  # meters
+    pixels_per_meter = 10
+    scale_x = mini_map_size[0] / (map_size.x * 1000 * pixels_per_meter)
+    scale_y = mini_map_size[1] / (map_size.y * 1000 * pixels_per_meter)
+    scale = (scale_x + scale_y) / 2
+
+    for creature in creatures:
+        pos = pymunk.Vec2d(*pymunk.pygame_util.to_pygame(creature.body.position, surface)) * zoom_level
+        pygame.draw.circle(surface, (255, 255, 255), (int(pos.x), int(pos.y)), 6)
+
+    for obstacle in obstacles:
+        pos = pymunk.Vec2d(*pymunk.pygame_util.to_pygame(obstacle.body.position, surface)) * zoom_level
+        pygame.draw.rect(surface, (0, 255, 0), (pos, (10 * zoom_level, 10 * zoom_level)))
+
+    for shelter in shelters:
+        pos = pymunk.Vec2d(*pymunk.pygame_util.to_pygame(shelter.body.position, surface)) * zoom_level
+        pygame.draw.rect(surface, (0, 0, 255), (pos, (10 * zoom_level, 10 * zoom_level)))
+
+    for stone in stones:
+        pos = pymunk.Vec2d(*pymunk.pygame_util.to_pygame(stone.body.position, surface)) * zoom_level
+        pygame.draw.rect(surface, (255, 255, 0), (pos, (10 * zoom_level, 10 * zoom_level)))
+
+
+class CustomBody(pymunk.Body):
+    def __init__(self, mass, moment, body_type=pymunk.Body.DYNAMIC):
+        super().__init__(mass, moment, body_type)
+        self.drag_coefficient = 0.1
+        self.collided = False
+
+    def apply_force(self, force, point=(0, 0)):
+        super().apply_force_at_local_point(force, point)
+
+
+class GameSpace(pymunk.Space):
+    def __init__(self, width, height):
+        super().__init__()
+        self.width = width
+        self.height = height
+        self.gravity = (0, 0)
+
+    def add(self, *args):
+        super().add(*args)
+
+    def apply_gravity(self, body):
+        gravity = 9.8
+        mass = body.mass
+        force = pymunk.Vec2d(0, -mass * gravity)
+        body.apply_force_at_world_point(force, body.position)
+
+    def apply_drag(self, body):
+        drag_coefficient = body.drag_coefficient
+        velocity_magnitude = body.velocity.length
+        drag_force = -drag_coefficient * velocity_magnitude * body.velocity
+        body.apply_force(drag_force)
+
+    def resolve_collision_with_wall(self, body):
+        if body.position.x - body.radius <= 0 or body.position.x + body.radius >= self.width:
+            body.velocity.x = -body.velocity.x
+        if body.position.y - body.radius <= 0 or body.position.y + body.radius >= self.height:
+            body.velocity.y = -body.velocity.y
+
+    def add_body_and_shape(self, body, shape):
+        self.add(body, shape)
+
+
+class Attributes:
+    def __init__(self, strength, intelligence, agility):
+        self.strength = strength
+        self.intelligence = intelligence
+        self.agility = agility
+
+
+class Creature:
+    def __init__(self, x, y, space):
+        self.city = None
+        self.location = []
+        self.x = x
+        self.y = y
+        self.space = space
+        self.shape = None
+        self.body, self.shape = self.create_body(x, y)
+        self.gui_manager = gui_manager
+        self.body = pymunk.Body()
+        self.age = random.randint(0, 120)
+        self.health = 100
+        self.tribe = None
+        self.is_pregnant = None
+        self.velocity = pymunk.Vec2d(0, 0)
+        self.acceleration = pymunk.Vec2d(0, 0)
+        self.time_of_day = "day"  # or "night"
+        self.wealth = []
+        self.state = "wandering"
+        self.wandering_duration = 0
+        self.direction = self.random_direction()
+        self.inventory = {"wood": 0, "food": 0, "rock": 0, "iron": 0, "stone": 0, "tool": 0}
+        self.sex = random.choice(["male", "female"])
+        self.attributes = Attributes(
+            strength=random.randint(1, 10),
+            intelligence=random.randint(1, 10),
+            agility=random.randint(1, 10)
+        )
+        self.reproduction_cooldown = 0
+
+    def create_body(self, x, y):
+        mass = 1
+        radius = 10
+        inertia = pymunk.moment_for_circle(mass, 0, radius, (0, 0))
+        body = CustomBody(1, float('inf'))
+        body.drag_coefficient = 0.1
+        shape = pymunk.Circle(body, radius)
+        shape.elasticity = 0.5
+        shape.friction = 0.5
+        body.position = x, y
+        self.space.add(body, shape)
+        self.velocity = Vector2(0, 0)
+        self.force = Vector2(0, 0)
+        return body, shape
+
+    def generate_random_numbers(n, min_value, max_value):
+        return [random.randint(min_value, max_value) for _ in range(n)]
+
+    strength, intelligence, agility = generate_random_numbers(3, 1, 10)
+
+    def apply_force(self, force):
+        self.body.apply_force_at_local_point(force, (0, 0))
+
+    # Calculate avoidance force based on obstacles
+    avoidance_force = pymunk.Vec2d(0, 0)
+    for obstacle in obstacles:
+        distance = self.body.position.get_distance(obstacle.body.position)
+        if distance < 1:
+            avoidance_force += (self.body.position - obstacle.body.position).normalized() / distance
+
+    # Use the helper method to apply force
+        self.apply_force(force)
+
+    # Calculate total force to be applied in each frame
+        total_force = pymunk.Vec2d(0, 0)
+        total_force += avoidance_force
+        total_force += repulsive_force
+        self.apply_force(total_force)
+
+    def draw(self, surface):
+        # Draw the body as a filled circle
+        pos = pymunk.pygame_util.to_pygame(self.body.position, surface)
+        pygame.draw.circle(surface, (255, 0, 0), pos, 10)
+
+        # Draw the head as a smaller circle
+        pygame.draw.circle(surface, (255, 255, 255), self.body.position, 6)
+
+        # Draw the arms as lines
+        arm_length = 15
+        arm_angle = self.velocity.angle + math.pi / 2
+        arm_1 = self.body.position + pymunk.Vec2d(math.cos(arm_angle) * arm_length, math.sin(arm_angle) * arm_length)
+        arm_2 = self.body.position + pymunk.Vec2d(math.cos(arm_angle + math.pi) * arm_length,
+                                                  math.sin(arm_angle + math.pi) * arm_length)
+        pygame.draw.line(surface, (0, 0, 255), self.body.position, arm_1, 5)
+        pygame.draw.line(surface, (0, 0, 255), self.body.position, arm_2, 5)
+
+        # Draw the eyes as small circles
+        eye_offset = 3
+        eye_angle = self.velocity.angle + math.pi / 2
+        eye_1 = self.body.position + pymunk.Vec2d(math.cos(eye_angle) * eye_offset, math.sin(eye_angle) * eye_offset)
+        eye_2 = self.body.position + pymunk.Vec2d(math.cos(eye_angle + math.pi) * eye_offset,
+                                                  math.sin(eye_angle + math.pi) * eye_offset)
+        pygame.draw.circle(surface, (0, 0, 0), eye_1, 2)
+        pygame.draw.circle(surface, (0, 0, 0), eye_2, 2)
+
+    def take_damage(self, amount, creatures, space):
+        self.health -= amount
+        if self.health <= 0:
+            self.die(creatures, space)
+
+    def die(self, creatures, space):
+        if self.body in space.bodies: 
+            space.remove(self.body, self.shape)
+
+    def join_tribe(self, tribe):
+        if self.tribe is None:
+            self.tribe = tribe
+
+    def leave_tribe(self):
+        if self.tribe is not None:
+            self.tribe = None
+
+    def wander(self):
+        force = 300 * self.direction
+        self.body.apply_force_at_local_point(force, (0, 0))
+        self.wandering_duration -= 1
+
+        if self.wandering_duration <= 0:
+            self.direction = self.random_direction()
+            self.wandering_duration = random.randint(30, 100)
+
+    def avoid_obstacles(self, obstacles):
+        avoidance_force = pymunk.Vec2d(0, 0)
+        for obstacle in obstacles:
+            distance = self.body.position.get_distance(obstacle.body.position)
+            if distance < sum(
+                    [abs(vertex.x - self.body.position.x) for vertex in obstacle.shape.get_vertices()]) / 2 * 1.5:
+                avoidance_force += (self.body.position - obstacle.body.position).normalized() * 1000 / distance
+        self.body.apply_force_at_local_point(avoidance_force, (0, 0))
+
+    def gather_resources(self, obstacles):
+        if sum(self.inventory.values()) < self.attributes.strength * 10:  # The creature can carry 10 units of resources per point of strength
+            for obstacle in obstacles:
+                distance = self.body.position.get_distance(obstacle.body.position)
+                if distance < obstacle.shape.area ** 0.5 * 1.5:
+                    resource_type = obstacle.resource_type
+                    gather_amount = 2 if self.inventory["tool"] > 0 else 1
+                    self.inventory[resource_type] += gather_amount
+                    print(f"Gathered {gather_amount} {resource_type}. Total: {self.inventory[resource_type]}")
+                    obstacles.remove(obstacle)
+                    space.remove(obstacle.body, obstacle.shape)
+
+    def craft_tool(self):
+        if self.inventory["wood"] >= 2 and self.inventory["stone"] >= 2:
+            self.inventory["wood"] -= 2
+            self.inventory["stone"] -= 2
+            self.inventory["tool"] += 1
+            print(f"Crafted 1 tool. Total: {self.inventory['tool']}")
+
+    def avoid_edges(self):
+        repulsive_force = pymunk.Vec2d(0, 0)
+        edge_padding = 50
+        if self.body.position.x < edge_padding:
+            repulsive_force = pymunk.Vec2d((edge_padding - self.body.position.x) * 10, repulsive_force.y)
+        elif self.body.position.y < edge_padding:
+            repulsive_force = pymunk.Vec2d(repulsive_force.x, (edge_padding - self.body.position.y) * 10)
+        elif self.body.position.x > width - edge_padding:
+            repulsive_force = pymunk.Vec2d(-(self.body.position.x - (width - edge_padding)) * 10, repulsive_force.y)
+        elif self.body.position.y > height - edge_padding:
+            repulsive_force = pymunk.Vec2d(repulsive_force.x, -(self.body.position.y - (height - edge_padding)) * 10)
+
+        self.body.apply_force_at_local_point(repulsive_force, (0, 0))
+
+    def reproduce(self, other_creature):
+        if self.sex != other_creature.sex and self.body.position.get_distance(other_creature.body.position) < 30:
+            if self.reproduction_cooldown <= 0 and other_creature.reproduction_cooldown <= 0 and not self.is_pregnant:
+                if self.inventory["food"] >= 5 and other_creature.inventory["food"] >= 5:
+                    if self.health > 50 and other_creature.health > 50:
+                        if self.age < 100 and other_creature.age < 100:
+                            offspring_x = (self.body.position.x + other_creature.body.position.x) / 2
+                            offspring_y = (self.body.position.y + other_creature.body.position.y) / 2
+                            offspring = Creature(offspring_x, offspring_y, self.space)
+                            offspring.sex = random.choice(["male", "female"])
+                            offspring.attributes.strength = (self.attributes.strength + other_creature.attributes.strength) / 2 + random.randint(-1, 1)
+                            offspring.attributes.intelligence = (self.attributes.intelligence + other_creature.attributes.intelligence) / 2 + random.randint(-1, 1)
+                            offspring.attributes.agility = (self.attributes.agility + other_creature.attributes.agility) / 2 + random.randint(-1, 1)
+                            self.reproduction_cooldown = 200
+                            self.is_pregnant = True
+                            other_creature.reproduction_cooldown = 200
+                            self.inventory["food"] -= 5
+                            other_creature.inventory["food"] -= 5
+                            return offspring
+        else:
+            return None
+
+    def trade(self, other_creature):
+        if self.tribe == other_creature.tribe:  # Creatures will only trade with members of their own tribe
+            for resource in self.inventory.keys():
+                if self.inventory[resource] > other_creature.inventory[resource]:
+                    trade_amount = (self.inventory[resource] - other_creature.inventory[resource]) // 2
+                    self.inventory[resource] -= trade_amount
+                    other_creature.inventory[resource] += trade_amount
+                    print(f"Traded {trade_amount} {resource} with another creature. Total: {self.inventory[resource]}")
+
+    def share_food(self):
+        if self.tribe is not None:
+            for creature in self.tribe.members:
+                if creature != self and creature.inventory["food"] < self.inventory["food"]:
+                    shared_amount = (self.inventory["food"] - creature.inventory["food"]) // 2
+                    self.inventory["food"] -= shared_amount
+                    creature.inventory["food"] += shared_amount
+                    print(f"Shared {shared_amount} food with another creature. Total: {self.inventory['food']}")
+
+    def defend(self, attacker):
+        if self.tribe is not None and attacker not in self.tribe.members:
+            self.direction = (self.body.position - attacker.body.position).normalized()
+            self.state = "fleeing"
+
+    def compete_for_resources(self, resources):
+        for resource in resources:
+            if self.body.position.get_distance(resource.body.position) < 100:
+                other_creatures = [c for c in self.tribe.members if c != self]
+                if other_creatures:
+                    nearest_creature = min(other_creatures, key=lambda c: self.body.position.get_distance(c.body.position))
+                    if self.body.position.get_distance(nearest_creature.body.position) < 50:
+                        self.direction = (self.body.position - nearest_creature.body.position).normalized()
+                        self.state = "fleeing"
+                    else:
+                        self.direction = (resource.body.position - self.body.position).normalized()
+                        self.state = "gathering"
+
+    def learn_from_experience(self):
+        if self.experience["attacked_by_predator"]:
+            self.attributes.agility += 1
+            self.experience["attacked_by_predator"] = False
+        if self.experience["found_food"]:
+            self.attributes.intelligence += 1
+            self.experience["found_food"] = False
+
+    def work(self):
+        self.wealth += self.attributes.strength
+
+    def random_direction(self):
+        # If the creature is already moving, continue in the same general direction
+        if self.body.velocity.length > 0:
+            # Normalize the current velocity to get the current direction
+            current_direction = self.body.velocity.normalized()
+
+            # Add some random variation to the direction
+            variation = pymunk.Vec2d(random.uniform(-1, 1), random.uniform(-1, 1))
+
+            # Combine the current direction with the variation
+            new_direction = (current_direction + variation).normalized()
+        else:
+            # If the creature is not moving, pick a completely random direction
+            new_direction = pymunk.Vec2d(random.uniform(-1, 1), random.uniform(-1, 1)).normalized()
+
+        return new_direction
+
+    def make_decision(self):
+        if self.health < 50:
+            if self.inventory["food"] > 0:
+                self.eat()
+            else:
+                self.trade()
+        elif self.wealth < 50:
+            if self.inventory["food"] > 0:
+                self.trade()
+            else:
+                self.work()
+        elif self.attributes.intelligence > 7:
+            if self.tribe and self.tribe.leader == self:
+                self.tribe.hold_election()
+            elif self.city and self.city.leader == self:
+                self.city.add_building(Building("Library"))
+        elif self.attributes.strength > 7:
+            if not self.tribe:
+                self.tribe = Tribe("New Tribe")
+                self.tribe.add_member(self)
+            elif not self.city:
+                self.city = self.tribe.found_city(self.location)
+        else:
+            self.wander()
+
+    def heal(self, amount):
+        """Heal the creature by a certain amount, up to a maximum of 100."""
+        self.health = min(100, self.health + amount)
+
+    def update(self, time_delta, time_of_day, obstacles, creatures, space):
+        self.body.position += self.velocity * time_delta
+        force = 300 * self.direction
+        self.body.apply_force_at_local_point(force, (0, 0))
+        predators = [c for c in creatures if isinstance(c, Predator)]
+        traps = [o for o in obstacles if isinstance(o, Trap)]
+        dangers = predators + traps
+        self.craft_tool()
+        self.avoid_edges()
+        if time_of_day == "night":
+            shelters = [o for o in obstacles if isinstance(o, Shelter)]
+            if shelters:
+                nearest_shelter = min(shelters, key=lambda s: self.body.position.get_distance(s.body.position))
+                self.direction = (nearest_shelter.body.position - self.body.position).normalized()
+            for creature in creatures:
+                if creature != self:
+                    self.trade(creature)
+                # Creatures take damage if they are old or unhealthy
+                if creature.age > 80 or creature.health < 50:
+                    creature.take_damage(10, creatures, space)
+
+                # Creatures take damage if they are hungry
+                if creature.inventory["food"] <= 0:
+                    creature.take_damage(5, creatures, space)
+                else:
+                    # Eating food restores health
+                    creature.inventory["food"] -= 1
+                    creature.heal(5)
+
+                # Creatures take damage if they fall from a height
+                if creature.body.velocity.y > 10:  # replace 10 with the threshold velocity for falling damage
+                    fall_damage = creature.body.velocity.y - 10  # the damage is proportional to the fall speed
+                    creature.take_damage(fall_damage, creatures, space)
+
+                # Creatures take damage if they are attacked by a predator
+                for predator in predators:
+                    if creature.body.position.get_distance(predator.body.position) < predator.attack_range:
+                        creature.take_damage(predator.attack_damage, creatures, space)
+
+                # Creatures take damage if they are ill
+                if creature.is_ill:  # assuming you have a boolean attribute 'is_ill'
+                    creature.take_damage(5, creatures, space)
+
+                # Creatures take damage if the weather is cold
+                if time_of_day == "night":  # assuming night time is cold
+                    creature.take_damage(5, creatures, space)
+
+                # Creatures take damage if they are in a dispute with another creature
+                if creature.in_dispute:  # assuming you have a boolean attribute 'in_dispute'
+                    creature.take_damage(10, creatures, space)
+
+                # Creatures take damage if the weather is hot
+                if time_of_day == "day":  # assuming day time is hot
+                    creature.take_damage(5, creatures, space)
+
+                # Creatures take damage if it is raining
+                if weather == "rain":  # assuming you have a variable 'weather' that can be "rain", "sun", etc.
+                    creature.take_damage(5, creatures, space)
+
+                # Creatures heal over time
+                creature.heal(1 * time_delta)  # heal 1 health per second
+
+                # Creatures heal if they have medicine
+                if creature.inventory["medicine"] > 0:
+                    creature.inventory["medicine"] -= 1
+                    creature.heal(20)
+
+                # Creatures heal if they receive healthcare from another creature
+                if creature.receiving_healthcare:  # assuming you have a boolean attribute 'receiving_healthcare'
+                    creature.heal(10)
+
+                # Creatures heal if they are resting
+                if creature.is_resting:  # assuming you have a boolean attribute 'is_resting'
+                    creature.heal(5)
+
+                # Creatures heal if they are sleeping
+                if creature.is_sleeping:  # assuming you have a boolean attribute 'is_sleeping'
+                    creature.heal(10)
+
+                if creature.health <= 0:
+                    creature.die(creatures, space)
+
+        if dangers:
+            nearest_danger = min(dangers, key=lambda d: self.body.position.get_distance(d.body.position))
+            if self.body.position.get_distance(nearest_danger.body.position) < 100:
+                self.state = "fleeing"
+                self.direction = (self.body.position - nearest_danger.body.position).normalized()
+            else:
+                self.state = "wandering"
+
+        # reproduction
+        new_creatures = []
+        for other_creature in creatures:
+            if other_creature != self:
+                offspring = self.reproduce(other_creature)
+                if offspring is not None:
+                    new_creatures.append(offspring)
+                    space.add(offspring.body, offspring.shape)
+        creatures.extend(new_creatures)
+
+        if self.reproduction_cooldown > 0:
+            self.reproduction_cooldown -= 1
+
+
+        self.velocity += self.acceleration
+
+
+class City:
+    def __init__(self, location, tribe):
+        self.leader = None
+        self.location = location
+        self.tribe = tribe
+        self.population = len(tribe.members)
+        self.resources = sum(member.inventory for member in tribe.members)
+        self.buildings = []
+
+    def add_building(self, building):
+        self.buildings.append(building)
+
+
+class Technology:
+    def __init__(self, name, attribute_increase):
+        self.name = name
+        self.attribute_increase = attribute_increase
+
+
+class Tribe:
+    def __init__(self, name):
+        self.name = name
+        self.members = []
+        self.leader = None
+
+    def add_member(self, creature):
+        self.members.append(creature)
+        creature.tribe = self
+
+    def remove_member(self, creature):
+        self.members.remove(creature)
+        creature.tribe = None
+
+    def total_wealth(self):
+        return sum(member.wealth for member in self.members)
+
+    def average_attribute(self, attribute):
+        return sum(getattr(member.attributes, attribute) for member in self.members) / len(self.members)
+
+    def highest_attribute(self, attribute):
+        return max(self.members, key=lambda member: getattr(member.attributes, attribute))
+
+    def hold_election(self):
+        self.leader = max(self.members, key=lambda member: member.wealth)
+
+    def change_leader(self, new_leader):
+        if new_leader in self.members:
+            self.leader = new_leader
+
+    def found_city(self, location):
+        return City(location, self)
+
+    def research_technology(self, technology):
+        self.technology.append(technology)
+        for member in self.members:
+            for attribute, increase in technology.attribute_increase.items():
+                setattr(member.attributes, attribute, getattr(member.attributes, attribute) + increase)
+
+
+def handle_events(gui_manager):
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            return False
+        gui_manager.process_events(event)
+    return True
+
+
+class Predator(Creature):
+    def __init__(self, x, y, space):
+        super().__init__(x, y, space)
+        self.color = (255, 0, 0)
+        self.attack_range = 50
+        self.attack_damage = 20
+
+    def update(self, time_delta, time_of_day, obstacles, creatures, space):
+        # Predators will try to move towards the nearest creature
+        nearest_creature = min(creatures, key=lambda c: self.body.position.get_distance(c.body.position))
+        if self.body.position.get_distance(nearest_creature.body.position) < self.attack_range:
+            self.state = "attacking"
+            self.direction = (nearest_creature.body.position - self.body.position).normalized()
+        else:
+            self.state = "wandering"
+
+    def attack(self, creature):
+        if self.state == "attacking":
+            creature.take_damage(self.attack_damage)
+
+class Obstacle:
+    def __init__(self, x, y, width, height, resource_type, space):
+        self.space = space
+        self.resource_type = resource_type
+        self.color = RESOURCE_COLORS[resource_type]
+        self.body, self.shape = self.create_body(x, y, width, height)
+        self.shape.resource_type = resource_type
+
+    def create_body(self, x, y, width, height):
+        mass = 0
+        moment = pymunk.moment_for_box(mass, (width, height))
+        obstacle_body = CustomBody(mass, moment, body_type=CustomBody.STATIC)
+        obstacle_shape = pymunk.Poly.create_box(obstacle_body, size=(width, height))
+        obstacle_body.position = x, y
+        return obstacle_body, obstacle_shape
+
+    def draw(self, surface):
+        for obstacle in obstacles:
+            pos = pymunk.pygame_util.to_pygame(obstacle.body.position, screen)
+            pygame.draw.rect(screen, (0, 255, 0), pygame.Rect(pos.x, pos.y, 10, 10))
+            pygame.draw.rect(surface, (0, 255, 0),
+                             (pos[0] - self.shape.width / 2, pos[1] - self.shape.height / 2,
+                              self.shape.width, self.shape.height))
+
+            # Draw some texture or color based on the resource type
+            color = (100, 100, 100)
+            if self.resource_type == "wood":
+                color = (139, 69, 19)
+            elif self.resource_type == "food":
+                color = (0, 255, 0)
+            elif self.resource_type == "rock":
+                color = (128, 128, 128)
+            elif self.resource_type == "iron":
+                color = (192, 192, 192)
+            pygame.draw.rect(surface, color,
+                             (pos[0] - self.shape.width / 2, pos[1] - self.shape.height / 2,
+                              self.shape.width, self.shape.height))
+
+# Define the variables
+x = 100  # The x-coordinate of the obstacle
+y = 100  # The y-coordinate of the obstacle
+width = 50  # The width of the obstacle
+height = 50  # The height of the obstacle
+resource_type = "wood"  # The resource type of the obstacle
+
+# Create a space
+space = GameSpace(800, 600)
+
+obstacle = Obstacle(x, y, width, height, resource_type, space)
+
+resource_types = ["wood", "stone", "food", "iron"]
+obstacles = []
+
+for resource_type in resource_types:
+    obstacle = Obstacle(x, y, width, height, resource_type, space)
+    obstacles.append(obstacle)
+
+
+class ResourcePoly(pymunk.Poly):
+    def __init__(self, body, size, resource_type):
+        super().__init__(body, size)
+        self.resource_type = resource_type
+
+
+def create_body(self, x, y, width, height):
+    obstacle_body = CustomBody(body_type=CustomBody.STATIC)
+    obstacle_shape = ResourcePoly.create_box(obstacle_body, size=(width, height), resource_type=self.resource_type)
+    obstacle_body.position = x, y
+    self.space.add(obstacle_body, obstacle_shape)
+    return obstacle_body, obstacle_shape
+
+
+class Trap(Obstacle):
+    def __init__(self, x, y, width, height, space):
+        super().__init__(x, y, width, height, "trap", space)
+        self.color = (255, 0, 0)  # Traps are red
+
+
+class Shelter(Obstacle):
+    def __init__(self, x, y, width, height, space):
+        super().__init__(x, y, width, height, "shelter", space)
+        self.color = (0, 0, 255)  # Shelters are blue
+
+
+class Stone(Obstacle):
+    def __init__(self, x, y, width, height, space):
+        super().__init__(x, y, width, height, "stone", space)
+        self.color = (128, 128, 128)  # Stones are gray
+
+
+def create_obstacles(space):
+    obstacles = []
+
+    # Create obstacles here
+    obstacle_data = [
+        {"x": 300, "y": 200, "width": 30, "height": 30, "resource_type": "wood"},
+        {"x": 500, "y": 300, "width": 40, "height": 40, "resource_type": "stone"},
+        # Add more obstacles as needed
+    ]
+
+    for data in obstacle_data:
+        x, y = data["x"], data["y"]
+        width, height = data["width"], data["height"]
+        resource_type = data["resource_type"]
+        obstacles.append(Obstacle(x, y, width, height, resource_type, space))
+
+    return obstacles
+
+
+def create_predators(space):
+    predators = []
+
+    # Create predators here
+    predator_data = [
+        {"x": 400, "y": 400},
+        {"x": 600, "y": 200},
+        # Add more predators as needed
+    ]
+
+    for data in predator_data:
+        x, y = data["x"], data["y"]
+        predators.append(Predator(x, y, space))
+
+    return predators
+
+
+def create_shelters(space):
+    shelters = []
+
+    # Create shelters here
+    shelter_data = [
+        {"x": 200, "y": 400, "width": 80, "height": 80},
+        {"x": 700, "y": 200, "width": 100, "height": 100},
+        # Add more shelters as needed
+    ]
+
+    for data in shelter_data:
+        x, y = data["x"], data["y"]
+        width, height = data["width"], data["height"]
+        shelters.append(Shelter(x, y, width, height, space))
+
+    return shelters
+
+
+def create_stones(space):
+    stones = []
+
+    # Create stones here
+    stone_data = [
+        {"x": 300, "y": 500, "width": 15, "height": 15},
+        {"x": 600, "y": 300, "width": 20, "height": 20},
+        # Add more stones as needed
+    ]
+
+    for data in stone_data:
+        x, y = data["x"], data["y"]
+        width, height = data["width"], data["height"]
+        stones.append(Stone(x, y, width, height, space))
+
+    return stones
+
+
+def render_game(screen, creatures, obstacles, shelters, stones, gui_manager, zoom_level):
+    game_state.screen.fill((255, 255, 255))
+
+    draw_grid(game_state.screen, 100)
+    draw_minimap(game_state.screen, game_state.creatures, game_state.obstacles, game_state.shelters, game_state.stones, zoom_level)
+
+
+# Create a Pygame GUI manager
+gui_manager = pygame_gui.UIManager((width, height))
+
+creature_count_label = UILabel(relative_rect=pygame.Rect((20, 20), (150, 20)),
+                               text='Creature Count',
+                               manager=gui_manager)
+
+creature_count_slider = UIHorizontalSlider(relative_rect=pygame.Rect((175, 20), (200, 20)),
+                                           start_value=10,
+                                           value_range=(1, 100),
+                                           manager=gui_manager)
+
+food_count_label = UILabel(relative_rect=pygame.Rect((20, 60), (150, 20)),
+                           text='Food Count',
+                           manager=gui_manager)
+
+food_count_slider = UIHorizontalSlider(relative_rect=pygame.Rect((175, 60), (200, 20)),
+                                       start_value=20,
+                                       value_range=(1, 200),
+                                       manager=gui_manager)
+
+reset_button = UIButton(relative_rect=pygame.Rect((20, 100), (100, 20)),
+                        text='Reset',
+                        manager=gui_manager)
+
+pause_button = UIButton(relative_rect=pygame.Rect((130, 100), (100, 20)),
+                        text='Pause',
+                        manager=gui_manager)
+
+zoom_in_button = UIButton(relative_rect=pygame.Rect((240, 100), (100, 20)),
+                          text='+',
+                          manager=gui_manager)
+
+zoom_out_button = UIButton(relative_rect=pygame.Rect((350, 100), (100, 20)),
+                           text='-',
+                           manager=gui_manager)
+
+# Create the ground
+space = GameSpace(800, 600)
+ground_shape = create_ground(space)
+
+
+def create_creatures(creature_count, space):
+    creatures = []
+    for _ in range(creature_count):
+        x = random.randint(0, width)
+        y = random.randint(0, height)
+        creature = Creature(x, y, space)
+        creatures.append(creature)
+    return creatures
+
+
+def create_obstacles(obstacle_count, space):
+    obstacles = []
+    resource_types = ["wood", "stone", "food", "iron"]  # list of possible resource types
+    for _ in range(obstacle_count):
+        x = random.randint(0, SCREEN_WIDTH)
+        y = random.randint(0, SCREEN_HEIGHT)
+        width = random.randint(10, 30)
+        height = random.randint(10, 30)
+        resource_type = random.choice(resource_types)  # randomly select a resource type
+        obstacle = Obstacle(x, y, width, height, resource_type, space)
+        obstacles.append(obstacle)
+    return obstacles
+
+
+def create_predators(predator_count, space):
+    predators = []
+    for _ in range(predator_count):
+        x = random.randint(100, 700)
+        y = random.randint(100, 500)
+        predator = Predator(x, y, space)
+        predators.append(predator)
+    return predators
+
+
+def create_shelters(shelter_count, space):
+    shelters = []
+    for _ in range(shelter_count):
+        x = random.randint(100, 700)
+        y = random.randint(100, 500)
+        width = random.randint(50, 100)
+        height = random.randint(50, 100)
+        shelter = Shelter(x, y, width, height, space)
+        shelters.append(shelter)
+    return shelters
+
+
+def create_stones(stone_count, space):
+    stones = []
+    for _ in range(stone_count):
+        x = random.randint(100, 700)
+        y = random.randint(100, 500)
+        width = random.randint(10, 20)
+        height = random.randint(10, 20)
+        stone = Stone(x, y, width, height, space)
+        stones.append(stone)
+    return stones
+
+
+def initialize_game(creature_count, obstacle_count, predator_count, shelter_count, stone_count, space):
+    creatures = create_creatures(creature_count, space)
+    obstacles = create_obstacles(obstacle_count, space)
+    predators = create_predators(predator_count, space)
+    shelters = create_shelters(shelter_count, space)
+    stones = create_stones(stone_count, space)
+    return creatures, obstacles, predators, shelters, stones
+
+
+game_state = GameState(space, screen)
+game_state.creatures, game_state.obstacles, game_state.predators, game_state.shelters, game_state.stones = initialize_game(10, 20, 5, 2, 10, space)
+
+
+def process_events(gui_manager, reset_button, game_state, space):
+    global zoom_level  # Declare zoom_level as global
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            return False
+
+        # Handle GUI events
+        if event.type == pygame_gui.UI_BUTTON_PRESSED:
+            if event.ui_element == reset_button:
+                game_state.creatures, game_state.obstacles, game_state.predators, game_state.shelters, game_state.stones = initialize_game(
+                    10, 20, 5, 2, 10, space)
+            elif event.ui_element == pause_button:
+                game_state.paused = not game_state.paused
+            elif event.ui_element == zoom_in_button:
+                zoom_level += 0.1
+            elif event.ui_element == zoom_out_button:
+                zoom_level -= 0.1
+
+        elif event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
+            if event.ui_element == creature_count_slider:
+                creature_count = int(event.value)
+                game_state.creatures = create_creatures(creature_count, space) 
+            elif event.ui_element == food_count_slider:
+                food_count = int(event.value)
+                game_state.obstacles = create_obstacles(food_count, space)
+
+        # Pass events to the GUI manager
+        gui_manager.process_events(event)
+
+    return True
+
+
+
+def main():
+    pygame.init()
+    pygame.freetype.init()
+    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+    space = GameSpace(800, 600)  # Create an instance of GameSpace
+    clock = pygame.time.Clock()
+    gui_manager = pygame_gui.UIManager((SCREEN_WIDTH, SCREEN_HEIGHT))
+
+    # Create an instance of DayNightCycle
+    day_night_cycle = DayNightCycle(day_length=5000, night_length=5000, dawn_length=1000, dusk_length=1000)
+
+    reset_button = pygame_gui.elements.UIButton(
+        relative_rect=pygame.Rect((10, 160), (100, 30)),
+        text='Reset',
+        manager=gui_manager
+    )
+
+    pause_button = pygame_gui.elements.UIButton(
+        relative_rect=pygame.Rect((120, 160), (100, 30)),
+        text='Pause',
+        manager=gui_manager
+    )
+
+    zoom_in_button = pygame_gui.elements.UIButton(
+        relative_rect=pygame.Rect((230, 160), (100, 30)),
+        text='Zoom In',
+        manager=gui_manager
+    )
+
+    zoom_out_button = pygame_gui.elements.UIButton(
+        relative_rect=pygame.Rect((340, 160), (100, 30)),
+        text='Zoom Out',
+        manager=gui_manager
+    )
+
+    creature_count_slider = pygame_gui.elements.UIHorizontalSlider(
+        relative_rect=pygame.Rect((10, 10), (200, 20)),
+        start_value=10,
+        value_range=(0, 100),
+        manager=gui_manager
+    )
+
+    obstacle_count_slider = pygame_gui.elements.UIHorizontalSlider(
+        relative_rect=pygame.Rect((10, 40), (200, 20)),
+        start_value=20,
+        value_range=(0, 100),
+        manager=gui_manager
+    )
+
+    predator_count_slider = pygame_gui.elements.UIHorizontalSlider(
+        relative_rect=pygame.Rect((10, 70), (200, 20)),
+        start_value=5,
+        value_range=(0, 10),
+        manager=gui_manager
+    )
+
+    shelter_count_slider = pygame_gui.elements.UIHorizontalSlider(
+        relative_rect=pygame.Rect((10, 100), (200, 20)),
+        start_value=2,
+        value_range=(0, 10),
+        manager=gui_manager
+    )
+
+    stone_count_slider = pygame_gui.elements.UIHorizontalSlider(
+        relative_rect=pygame.Rect((10, 130), (200, 20)),
+        start_value=10,
+        value_range=(0, 50),
+        manager=gui_manager
+    )
+
+    # Create an instance of GameState
+    game_state = GameState(space, screen)
+
+    # Define the initial values for the sliders
+    creature_count = 10
+    obstacle_count = 20
+    predator_count = 5
+    shelter_count = 2
+    stone_count = 10
+
+    # Initialize the game and store the entities in game_state
+    game_state.creatures, game_state.obstacles, game_state.predators, game_state.shelters, game_state.stones = initialize_game(
+        creature_count, obstacle_count, predator_count, shelter_count, stone_count, space
+    )
+
+    # Game loop
+    running = True
+    zoom_level = 1.0
+
+    while running:
+        time_delta = clock.tick(60) / 1000
+        running = process_events(gui_manager, reset_button, game_state, space)
+        if not running:
+            break
+
+        day_night_cycle.update(time_delta)
+        time_of_day = day_night_cycle.get_time_of_day()
+        running = handle_events(gui_manager)
+        if not running:
+            break
+        if not game_state.paused:
+            update_game(time_delta, gui_manager)
+
+        # Clear the screen
+        screen.fill((255, 255, 255))
+
+        # Render the game
+        render_game(screen, game_state.creatures, game_state.obstacles, game_state.shelters, game_state.stones, gui_manager,
+                    zoom_level)
+
+        # Draw the GUI
+        gui_manager.draw_ui(screen)
+
+        # Update the display
+        pygame.display.flip()
+
+
+def update_game(time_delta, gui_manager):
+    running = handle_events(gui_manager)
+    if not running:
+        return False
+
+    # Update physics simulation
+    space.step(time_delta)
+
+    # Update the state of the game
+    update_state(time_delta)
+
+    # Update the day/night cycle
+    day_night_cycle.update(time_delta)
+
+    # Get the current time of day
+    time_of_day = day_night_cycle.get_time_of_day()
+
+    # Update the GUI
+    gui_manager.update(time_delta)
+
+    return True
+
+
+def update_state(time_delta):
+    time_of_day = day_night_cycle.get_time_of_day()
+
+    space.step(time_delta)
+
+    for creature in game_state.creatures:
+        creature.update(time_delta, time_of_day, game_state.obstacles, game_state.creatures, space)
+
+    for predator in game_state.predators:
+        predator.update(time_delta, time_of_day, game_state.obstacles, game_state.creatures, space)
+
+    # Update each creature
+    for creature in game_state.creatures:
+        creature.update(time_delta, time_of_day, game_state.obstacles, game_state.creatures, space)
+
+
+if __name__ == "__main__":
+    main()
